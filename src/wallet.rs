@@ -2,7 +2,7 @@ use std::error::Error;
 use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
 use rand::rngs::OsRng;
 use sha2::{Sha256, Digest};
-use ripemd160::Ripemd160;
+use ripemd::Ripemd160;
 use bs58;
 use std::collections::HashMap;
 use std::fs;
@@ -72,8 +72,13 @@ impl Wallet {
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let secp = Secp256k1::new();
         
+        // 创建消息哈希
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hasher.finalize();
+        
         // 创建消息
-        let message = Message::from_digest_slice(data)?;
+        let message = Message::from_slice(&hash)?;
         
         // 从字节创建私钥
         let secret_key = SecretKey::from_slice(&self.secret_key)?;
@@ -87,8 +92,13 @@ impl Wallet {
     pub fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool, Box<dyn Error>> {
         let secp = Secp256k1::new();
         
+        // 创建消息哈希
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hasher.finalize();
+        
         // 创建消息
-        let message = Message::from_digest_slice(data)?;
+        let message = Message::from_slice(&hash)?;
         
         // 从字节创建公钥
         let public_key = PublicKey::from_slice(&self.public_key)?;

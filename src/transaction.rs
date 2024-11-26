@@ -4,10 +4,9 @@ use sha2::{Sha256, Digest};
 use crate::utxo::UTXOSet;
 use crate::wallet::Wallet;
 use std::collections::HashMap;
-use bincode;
-use hex;
+use bs58;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxInput {
     pub txid: String,
     pub vout: i32,
@@ -15,13 +14,13 @@ pub struct TxInput {
     pub pub_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxOutput {
     pub value: i32,
     pub pub_key_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: String,
     pub inputs: Vec<TxInput>,
@@ -79,7 +78,7 @@ impl Transaction {
         // 对每个输入进行签名
         for i in 0..self.inputs.len() {
             // 设置当前输入的公钥
-            tx_copy.inputs[i].pub_key = Some(wallet.get_address());
+            tx_copy.inputs[i].pub_key = Some(bs58::encode(wallet.get_public_key()).into_string());
             
             // 计算交易哈希并签名
             let tx_hash = tx_copy.hash()?;
@@ -87,7 +86,7 @@ impl Transaction {
             
             // 保存签名和公钥
             self.inputs[i].signature = signature;
-            self.inputs[i].pub_key = Some(wallet.get_address());
+            self.inputs[i].pub_key = Some(bs58::encode(wallet.get_public_key()).into_string());
             
             // 清除当前输入的公钥，为下一个输入做准备
             tx_copy.inputs[i].pub_key = None;
@@ -129,7 +128,8 @@ impl Transaction {
             
             // 使用公钥验证签名
             let pub_key_str = input.pub_key.as_ref().ok_or("缺少公钥")?;
-            let verifying_wallet = Wallet::from_public_key(pub_key_str.as_bytes())?;
+            let pub_key = bs58::decode(pub_key_str).into_vec().map_err(|_| "无效的公钥")?;
+            let verifying_wallet = Wallet::from_public_key(&pub_key)?;
             
             if !verifying_wallet.verify(tx_hash.as_bytes(), &input.signature)? {
                 return Ok(false);
