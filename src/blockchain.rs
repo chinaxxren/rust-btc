@@ -1,66 +1,15 @@
-use std::error::Error;
-use std::fmt;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn, error, debug};
 
-use crate::block::{Block, BlockError};
+use crate::block::Block;
 use crate::transaction::Transaction;
-use crate::utxo::UTXOSet;
-use crate::wallet::Wallet;
+use crate::error::{Result, RustBtcError};
 
 const MAX_BLOCK_SIZE: usize = 1_000_000; // 1MB
 const MAX_CHAIN_LENGTH: usize = 1_000_000;
-
-#[derive(Debug)]
-pub enum BlockchainError {
-    SerializationError(String),
-    ValidationError(String),
-    InvalidBlock(String),
-    InvalidChain(String),
-    BlockNotFound(String),
-    TransactionError(String),
-    UTXOError(String),
-    IOError(String),
-}
-
-impl fmt::Display for BlockchainError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            BlockchainError::SerializationError(msg) => write!(f, "序列化错误: {}", msg),
-            BlockchainError::ValidationError(msg) => write!(f, "验证错误: {}", msg),
-            BlockchainError::InvalidBlock(msg) => write!(f, "无效区块: {}", msg),
-            BlockchainError::InvalidChain(msg) => write!(f, "无效区块链: {}", msg),
-            BlockchainError::BlockNotFound(msg) => write!(f, "区块未找到: {}", msg),
-            BlockchainError::TransactionError(msg) => write!(f, "交易错误: {}", msg),
-            BlockchainError::UTXOError(msg) => write!(f, "UTXO错误: {}", msg),
-            BlockchainError::IOError(msg) => write!(f, "IO错误: {}", msg),
-        }
-    }
-}
-
-impl Error for BlockchainError {}
-
-impl From<BlockError> for BlockchainError {
-    fn from(error: BlockError) -> Self {
-        match error {
-            BlockError::ValidationError(msg) => BlockchainError::ValidationError(msg),
-            BlockError::HashError(msg) => BlockchainError::ValidationError(msg),
-            BlockError::TimestampError(msg) => BlockchainError::ValidationError(msg),
-            BlockError::TransactionError(msg) => BlockchainError::TransactionError(msg),
-        }
-    }
-}
-
-impl From<Box<dyn Error>> for BlockchainError {
-    fn from(error: Box<dyn Error>) -> Self {
-        BlockchainError::ValidationError(error.to_string())
-    }
-}
-
-type Result<T> = std::result::Result<T, BlockchainError>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Blockchain {
@@ -70,161 +19,164 @@ pub struct Blockchain {
 
 impl Blockchain {
     pub fn new() -> Result<Self> {
-        Ok(Self {
+        info!("创建新的区块链");
+        Ok(Blockchain {
             blocks: Vec::new(),
             current_hash: String::new(),
         })
     }
 
     pub fn add_block(&mut self, block: Block) -> Result<()> {
-        // 验证区块大小
+        debug!("开始添加新区块, 前置哈希: {}", block.prev_block_hash);
+        
         let block_size = bincode::serialize(&block)
-            .map_err(|e| BlockchainError::SerializationError(e.to_string()))?
+            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?
             .len();
+            
         if block_size > MAX_BLOCK_SIZE {
-            return Err(BlockchainError::InvalidBlock(format!(
+            error!("区块大小 {} 超过最大限制 {}", block_size, MAX_BLOCK_SIZE);
+            return Err(RustBtcError::InvalidBlock(format!(
                 "区块大小 {} 超过最大限制 {}",
                 block_size, MAX_BLOCK_SIZE
             )));
         }
-
-        // 验证链长度
+        
         if self.blocks.len() >= MAX_CHAIN_LENGTH {
-            return Err(BlockchainError::InvalidChain(format!(
+            error!("区块链长度 {} 超过最大限制 {}", self.blocks.len(), MAX_CHAIN_LENGTH);
+            return Err(RustBtcError::InvalidChain(format!(
                 "区块链长度 {} 超过最大限制 {}",
                 self.blocks.len(), MAX_CHAIN_LENGTH
             )));
         }
-
-        // 验证区块哈希
-        if !self.current_hash.is_empty() && block.prev_block_hash != self.current_hash {
-            return Err(BlockchainError::InvalidBlock(format!(
-                "区块的前一个哈希 {} 与当前哈希 {} 不匹配",
+        
+        if !self.blocks.is_empty() && block.prev_block_hash != self.current_hash {
+            error!("区块的前置哈希 {} 与当前哈希 {} 不匹配", 
+                block.prev_block_hash, self.current_hash);
+            return Err(RustBtcError::InvalidBlock(format!(
+                "区块的前置哈希 {} 与当前哈希 {} 不匹配",
                 block.prev_block_hash, self.current_hash
             )));
         }
 
-        // 验证区块
-        if !block.is_valid().map_err(|e| BlockchainError::ValidationError(e.to_string()))? {
-            return Err(BlockchainError::InvalidBlock("区块验证失败".to_string()));
-        }
-
-        // 验证区块中的所有交易
-        for tx in &block.transactions {
-            if !tx.verify(&UTXOSet::new())? {
-                return Err(BlockchainError::InvalidBlock(format!(
-                    "区块中的交易 {} 验证失败",
-                    tx.hash()?
-                )));
-            }
-        }
-
-        // 更新当前哈希和区块
-        self.current_hash = block.hash()
-            .map_err(|e| BlockchainError::ValidationError(e.to_string()))?;
+        self.current_hash = block.hash.clone();
         self.blocks.push(block);
-
+        info!("成功添加新区块，当前区块链长度: {}", self.blocks.len());
+        
         Ok(())
     }
 
     pub fn get_block(&self, hash: &str) -> Result<&Block> {
+        debug!("查找哈希为 {} 的区块", hash);
         self.blocks
             .iter()
-            .find(|block| block.hash().map(|h| h == hash).unwrap_or(false))
-            .ok_or_else(|| BlockchainError::BlockNotFound(hash.to_string()))
+            .find(|block| block.hash == hash)
+            .ok_or_else(|| {
+                error!("未找到哈希为 {} 的区块", hash);
+                RustBtcError::BlockNotFound(hash.to_string())
+            })
     }
 
     pub fn get_last_hash(&self) -> Result<String> {
         if self.blocks.is_empty() {
-            Ok(String::new())
-        } else {
-            Ok(self.current_hash.clone())
+            warn!("区块链为空，无法获取最后的哈希值");
+            return Ok(String::new());
         }
+        debug!("获取最后区块哈希: {}", self.current_hash);
+        Ok(self.current_hash.clone())
     }
 
     pub fn save_to_file(&self) -> Result<()> {
-        let data = bincode::serialize(&self)
-            .map_err(|e| BlockchainError::SerializationError(e.to_string()))?;
+        info!("开始保存区块链到文件");
+        let data = bincode::serialize(self)
+            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?;
         fs::write("blockchain.dat", data)
-            .map_err(|e| BlockchainError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+        info!("区块链成功保存到文件");
         Ok(())
     }
 
     pub fn load_from_file() -> Result<Self> {
+        info!("从文件加载区块链");
         if !Path::new("blockchain.dat").exists() {
-            return Ok(Self::new()?);
+            warn!("区块链文件不存在，创建新的区块链");
+            return Self::new();
         }
 
         let data = fs::read("blockchain.dat")
-            .map_err(|e| BlockchainError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
         let blockchain = bincode::deserialize(&data)
-            .map_err(|e| BlockchainError::SerializationError(e.to_string()))?;
+            .map_err(|e| RustBtcError::DeserializationError(e.to_string()))?;
+        info!("成功从文件加载区块链");
         Ok(blockchain)
     }
 
     pub fn validate_chain(&self) -> Result<bool> {
-        // 验证所有区块
-        for (i, block) in self.blocks.iter().enumerate() {
-            // 验证区块
-            if !block.is_valid()? {
-                return Err(BlockchainError::InvalidBlock(format!(
-                    "区块 {} 验证失败",
-                    i
-                )));
-            }
-
-            // 验证区块哈希链接
-            if i > 0 {
-                let prev_block = &self.blocks[i - 1];
-                if block.prev_block_hash != prev_block.hash()? {
-                    return Err(BlockchainError::InvalidChain(format!(
-                        "区块 {} 的前一个哈希与区块 {} 的哈希不匹配: {} != {}",
-                        i,
-                        i - 1,
-                        block.prev_block_hash,
-                        prev_block.hash()?
-                    )));
-                }
-            }
-
-            // 验证区块中的所有交易
-            for tx in &block.transactions {
-                if !tx.verify(&UTXOSet::new())
-                    .map_err(|e| BlockchainError::TransactionError(e.to_string()))? {
-                    return Err(BlockchainError::InvalidBlock(format!(
-                        "区块 {} 中的交易 {} 验证失败",
-                        i,
-                        tx.hash().map_err(|e| BlockchainError::TransactionError(e.to_string()))?
-                    )));
-                }
-            }
+        info!("开始验证区块链");
+        if self.blocks.is_empty() {
+            warn!("区块链为空，验证通过");
+            return Ok(true);
         }
 
+        let mut prev_hash = String::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            debug!("验证第 {} 个区块", i + 1);
+            
+            // 验证区块哈希
+            if !block.verify_hash()? {
+                error!("区块 {} 哈希验证失败", i + 1);
+                return Ok(false);
+            }
+
+            // 验证前置哈希
+            if i > 0 && block.prev_block_hash != prev_hash {
+                error!("区块 {} 的前置哈希不匹配", i + 1);
+                return Ok(false);
+            }
+
+            prev_hash = block.hash.clone();
+        }
+
+        info!("区块链验证完成，验证通过");
         Ok(true)
     }
 
     pub fn get_block_height(&self) -> usize {
+        debug!("获取区块链高度: {}", self.blocks.len());
         self.blocks.len()
     }
 
     pub fn get_blocks_after(&self, hash: &str) -> Result<Vec<&Block>> {
-        let start_index = self
-            .blocks
-            .iter()
-            .position(|block| block.hash().map(|h| h == hash).unwrap_or(false))
-            .ok_or_else(|| BlockchainError::BlockNotFound(hash.to_string()))?;
+        debug!("获取哈希 {} 之后的所有区块", hash);
+        let mut blocks = Vec::new();
+        let mut found = false;
 
-        Ok(self.blocks[start_index + 1..].iter().collect())
+        for block in &self.blocks {
+            if found {
+                blocks.push(block);
+            }
+            if block.hash == hash {
+                found = true;
+            }
+        }
+
+        if !found && !hash.is_empty() {
+            warn!("未找到哈希为 {} 的区块", hash);
+            return Err(RustBtcError::BlockNotFound(hash.to_string()));
+        }
+
+        debug!("找到 {} 个后续区块", blocks.len());
+        Ok(blocks)
     }
 
     pub fn find_transaction(&self, id: &str) -> Option<Transaction> {
-        for block in &self.blocks {
-            for tx in &block.transactions {
-                if tx.id == id {
-                    return Some(tx.clone());
-                }
+        debug!("查找交易ID: {}", id);
+        for block in self.blocks.iter().rev() {
+            if let Some(tx) = block.transactions.iter().find(|tx| tx.id == id) {
+                debug!("找到交易 {}", id);
+                return Some(tx.clone());
             }
         }
+        warn!("未找到交易 {}", id);
         None
     }
 
@@ -271,7 +223,7 @@ mod tests {
         // 添加无效区块应该失败
         assert!(matches!(
             blockchain.add_block(invalid_block),
-            Err(BlockchainError::InvalidBlock(_))
+            Err(RustBtcError::InvalidBlock(_))
         ));
 
         Ok(())

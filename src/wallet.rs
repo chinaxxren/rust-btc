@@ -1,4 +1,3 @@
-use std::error::Error;
 use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
 use rand::rngs::OsRng;
 use sha2::{Sha256, Digest};
@@ -8,6 +7,10 @@ use std::collections::HashMap;
 use std::fs;
 use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
+use std::path::Path;
+use hex;
+
+use super::error::{Result, RustBtcError};
 
 const VERSION: u8 = 0x00;
 const CHECKSUM_LENGTH: usize = 4;
@@ -22,7 +25,7 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    pub fn new() -> Result<Wallet, Box<dyn Error>> {
+    pub fn new() -> Result<Wallet> {
         let mut rng = OsRng::default();
         
         // 生成密钥对
@@ -54,52 +57,64 @@ impl Wallet {
         hasher.update(first_hash);
         let second_hash = hasher.finalize();
         
-        let mut address = version_payload;
-        address.extend_from_slice(&second_hash[..CHECKSUM_LENGTH]);
+        let checksum = &second_hash[..CHECKSUM_LENGTH];
+        version_payload.extend(checksum);
         
-        bs58::encode(address).into_string()
+        bs58::encode(version_payload).into_string()
     }
     
     pub fn get_public_key(&self) -> &[u8] {
         &self.public_key
     }
+
+    pub fn get_private_key(&self) -> &[u8] {
+        &self.secret_key
+    }
     
-    pub fn from_public_key(pub_key: &[u8]) -> Result<Wallet, Box<dyn Error>> {
+    pub fn from_public_key(pub_key: &[u8]) -> Result<Wallet> {
         Ok(Wallet {
             secret_key: Vec::new(),
             public_key: pub_key.to_vec(),
         })
     }
     
-    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-        // 创建消息哈希
-        let hash = Sha256::digest(data);
-        
-        // 创建消息
-        let message = Message::from_slice(&hash)?;
-        
-        // 从字节创建私钥
-        let secret_key = SecretKey::from_slice(&self.secret_key)?;
-        
-        // 签名消息
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if self.secret_key.is_empty() {
+            println!("Cannot sign with read-only wallet");
+            return Err(RustBtcError::ValidationError("无法使用只读钱包签名".to_string()));
+        }
+
+        println!("Data to sign: {:?}", hex::encode(data));
+
+        let secret_key = SecretKey::from_slice(&self.secret_key)
+            .map_err(|e| {
+                println!("Failed to parse secret key: {}", e);
+                RustBtcError::InvalidSignature(e.to_string())
+            })?;
+
+        let message = Message::from_slice(data)
+            .map_err(|e| {
+                println!("Failed to create message: {}", e);
+                RustBtcError::InvalidSignature(e.to_string())
+            })?;
+
         let signature = SECP.sign_ecdsa(&message, &secret_key);
-        
-        Ok(signature.serialize_compact().to_vec())
+        let signature_bytes = signature.serialize_compact().to_vec();
+        println!("Generated signature: {:?}", hex::encode(&signature_bytes));
+        Ok(signature_bytes)
     }
     
-    pub fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool, Box<dyn Error>> {
-        // 创建消息哈希
-        let hash = Sha256::digest(data);
-        
-        // 创建消息
-        let message = Message::from_slice(&hash)?;
-        
-        // 从字节创建公钥和签名
-        let public_key = PublicKey::from_slice(&self.public_key)?;
-        let signature = secp256k1::ecdsa::Signature::from_compact(signature)?;
-        
-        // 验证签名
-        Ok(SECP.verify_ecdsa(&message, &signature, &public_key).is_ok())
+    pub fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        let public_key = PublicKey::from_slice(&self.public_key)
+            .map_err(|e| RustBtcError::InvalidSignature(e.to_string()))?;
+
+        let message = Message::from_slice(data)
+            .map_err(|e| RustBtcError::InvalidSignature(e.to_string()))?;
+
+        let sig = secp256k1::ecdsa::Signature::from_compact(signature)
+            .map_err(|e| RustBtcError::InvalidSignature(e.to_string()))?;
+
+        Ok(SECP.verify_ecdsa(&message, &sig, &public_key).is_ok())
     }
 }
 
@@ -110,9 +125,14 @@ pub struct Wallets {
 
 impl Wallets {
     // 创建或加载钱包集合
-    pub fn new() -> Result<Wallets, Box<dyn Error>> {
-        if let Ok(data) = fs::read(WALLET_FILE) {
-            let wallets: Wallets = bincode::deserialize(&data)?;
+    pub fn new() -> Result<Wallets> {
+        if Path::new(WALLET_FILE).exists() {
+            let data = fs::read(WALLET_FILE)
+                .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+                
+            let wallets: Wallets = bincode::deserialize(&data)
+                .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::SerializationError(e.to_string()))?;
+                
             Ok(wallets)
         } else {
             Ok(Wallets {
@@ -122,7 +142,7 @@ impl Wallets {
     }
     
     // 创建新钱包
-    pub fn create_wallet(&mut self) -> Result<String, Box<dyn Error>> {
+    pub fn create_wallet(&mut self) -> Result<String> {
         let wallet = Wallet::new()?;
         let address = wallet.get_address();
         
@@ -143,9 +163,13 @@ impl Wallets {
     }
     
     // 保存钱包到文件
-    fn save(&self) -> Result<(), Box<dyn Error>> {
-        let data = bincode::serialize(self)?;
-        fs::write(WALLET_FILE, data)?;
+    pub fn save(&self) -> Result<()> {
+        let data = bincode::serialize(&self)
+            .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::SerializationError(e.to_string()))?;
+
+        fs::write(WALLET_FILE, data)
+            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            
         Ok(())
     }
 }
