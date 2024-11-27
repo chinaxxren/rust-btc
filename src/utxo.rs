@@ -1,169 +1,180 @@
-use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use std::fs;
 use std::error::Error;
-use crate::block::Block;
-use crate::transaction::TxOutput;
+use std::fs;
+use std::path::Path;
+
+use bs58;
+use ring::digest;
+use serde::{Deserialize, Serialize};
+
 use crate::blockchain::Blockchain;
+use crate::transaction::{Transaction, TxOutput,TxInput};
 
-const UTXO_DB_FILE: &str = "data/utxo.dat";
+const UTXO_TREE_FILE: &str = "data/utxo.dat";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UTXOSet {
-    utxos: HashMap<String, TxOutput>,
+    utxos: HashMap<String, Vec<(usize, TxOutput)>>,
 }
 
 impl UTXOSet {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
-        // 确保目录存在
-        if let Some(parent) = std::path::Path::new(UTXO_DB_FILE).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        
-        // 尝试从文件加载现有的UTXO集
-        if let Ok(data) = fs::read(UTXO_DB_FILE) {
-            if let Ok(utxo_set) = bincode::deserialize(&data) {
-                println!("从文件加载了现有的UTXO集");
-                return Ok(utxo_set);
-            }
-        }
-        
-        println!("创建了新的UTXO集");
-        Ok(UTXOSet {
+    pub fn new() -> Self {
+        UTXOSet {
             utxos: HashMap::new(),
-        })
+        }
     }
 
-    fn save(&self) -> Result<(), Box<dyn Error>> {
-        let data = bincode::serialize(self)?;
-        fs::write(UTXO_DB_FILE, data)?;
-        println!("保存了UTXO集到文件");
-        Ok(())
-    }
-
-    pub fn update(&mut self, block: &Block) -> Result<(), Box<dyn Error>> {
-        println!("\n更新UTXO集...");
-        println!("当前UTXO数量: {}", self.utxos.len());
-        
-        // 处理区块中的每个交易
-        for tx in &block.transactions {
-            println!("处理交易: {}", tx.id);
-            
-            // 如果不是coinbase交易，删除已花费的输出
+    pub fn update(&mut self, block_txs: &[Transaction]) -> Result<(), Box<dyn Error>> {
+        for tx in block_txs {
+            // 删除已花费的输出
             if !tx.is_coinbase() {
                 for input in &tx.inputs {
-                    let key = format!("{}:{}", input.txid, input.vout);
-                    self.utxos.remove(&key);
-                    println!("删除已花费的UTXO: {}", key);
+                    if let Some(outputs) = self.utxos.get_mut(&input.txid) {
+                        outputs.retain(|(vout, _)| *vout != input.vout);
+                        if outputs.is_empty() {
+                            self.utxos.remove(&input.txid);
+                        }
+                    }
                 }
-            } else {
-                println!("这是一个coinbase交易");
             }
-            
+
             // 添加新的未花费输出
-            for (idx, output) in tx.outputs.iter().enumerate() {
-                let key = format!("{}:{}", tx.id, idx);
-                println!("添加新的UTXO: {} -> {} 代币到地址 {}", key, output.value, output.pub_key_hash);
-                self.utxos.insert(key, output.clone());
+            let mut outputs = Vec::new();
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                outputs.push((vout, output.clone()));
             }
+            self.utxos.insert(tx.id.clone(), outputs);
         }
-        
-        println!("更新后UTXO数量: {}", self.utxos.len());
-        self.save()?;
+
         Ok(())
     }
 
-    pub fn get_balance(&self, address: &str) -> Result<i32, Box<dyn Error>> {
-        let mut balance = 0;
-        
-        println!("\n计算地址 {} 的余额", address);
-        println!("当前UTXO数量: {}", self.utxos.len());
-        
-        for (key, output) in &self.utxos {
-            println!("检查UTXO {} -> {} 代币到地址 {}", key, output.value, output.pub_key_hash);
-            if output.pub_key_hash == address {
-                balance += output.value;
-                println!("找到一个属于该地址的UTXO，余额增加 {}", output.value);
-            }
-        }
-        
-        println!("最终余额: {}", balance);
-        Ok(balance)
-    }
-
-    pub fn find_spendable_outputs(&self, address: &str, amount: i32) -> Result<(i32, Vec<(String, i32)>), Box<dyn Error>> {
-        let mut unspent_outputs = Vec::new();
+    pub fn find_spendable_outputs(
+        &self,
+        address: &str,
+        amount: i64,
+    ) -> Result<(i64, HashMap<String, Vec<(usize, TxOutput)>>), Box<dyn Error>> {
+        let mut unspent_outputs = HashMap::new();
         let mut accumulated = 0;
-        
-        for (utxo_key, output) in &self.utxos {
-            if output.pub_key_hash == address {
-                let parts: Vec<&str> = utxo_key.split(':').collect();
-                if parts.len() != 2 {
-                    continue;
-                }
-                
-                let txid = parts[0].to_string();
-                let vout = parts[1].parse::<i32>()?;
-                
-                accumulated += output.value;
-                unspent_outputs.push((txid, vout));
-                
+
+        for (txid, outputs) in &self.utxos {
+            let mut tx_outputs = Vec::new();
+            for (vout, output) in outputs {
                 if accumulated >= amount {
                     break;
                 }
+                
+                let address_bytes = bs58::decode(address).into_vec()?;
+                if output.pub_key_hash == address_bytes {
+                    accumulated += output.value;
+                    tx_outputs.push((*vout, output.clone()));
+                }
+            }
+            
+            if !tx_outputs.is_empty() {
+                unspent_outputs.insert(txid.clone(), tx_outputs);
+            }
+            
+            if accumulated >= amount {
+                break;
             }
         }
-        
-        if accumulated < amount {
-            return Err(format!("地址 {} 余额不足，需要 {} 代币", address, amount).into());
-        }
-        
+
         Ok((accumulated, unspent_outputs))
     }
 
-    // 重建UTXO集合
+    pub fn verify_input(&self, input: &TxInput) -> Result<bool, Box<dyn Error>> {
+        if let Some(outputs) = self.utxos.get(&input.txid) {
+            if let Some((_, output)) = outputs.iter().find(|(vout, _)| *vout == input.vout) {
+                // 验证公钥哈希是否匹配
+                let mut hasher = digest::Context::new(&digest::SHA256);
+                hasher.update(&input.pubkey);
+                let pub_key_hash = hasher.finish();
+                
+                // 验证签名
+                if !input.signature.is_empty() && output.pub_key_hash == pub_key_hash.as_ref() {
+                    // TODO: 实现更严格的签名验证
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn exists_utxo(&self, txid: &str, vout: usize) -> Result<bool, Box<dyn Error>> {
+        if let Some(outputs) = self.utxos.get(txid) {
+            return Ok(outputs.iter().any(|(v, _)| *v == vout));
+        }
+        Ok(false)
+    }
+
+    pub fn save(&self) -> Result<(), Box<dyn Error>> {
+        let data = bincode::serialize(self)?;
+        fs::write(UTXO_TREE_FILE, data)?;
+        Ok(())
+    }
+
+    pub fn load() -> Result<Self, Box<dyn Error>> {
+        if Path::new(UTXO_TREE_FILE).exists() {
+            let data = fs::read(UTXO_TREE_FILE)?;
+            let utxo_set: UTXOSet = bincode::deserialize(&data)?;
+            Ok(utxo_set)
+        } else {
+            Ok(UTXOSet::new())
+        }
+    }
+
     pub fn reindex(&mut self, blockchain: &Blockchain) -> Result<(), Box<dyn Error>> {
-        println!("\n重建UTXO集合...");
-        
-        // 清空当前UTXO
         self.utxos.clear();
         
-        // 遍历所有区块
-        for block in blockchain.blocks()? {
-            // 遍历区块中的所有交易
-            for tx in &block.transactions {
-                println!("处理交易: {}", tx.id);
-                
-                // 移除已使用的UTXO
-                for input in &tx.inputs {
-                    let key = format!("{}:{}", input.txid, input.vout);
-                    self.utxos.remove(&key);
+        for block in blockchain.blocks()?.iter() {
+            for tx in block.transactions.iter() {
+                // Remove spent outputs
+                if !tx.is_coinbase() {
+                    for input in &tx.inputs {
+                        if let Some(outputs) = self.utxos.get_mut(&input.txid) {
+                            outputs.retain(|(vout, _)| *vout != input.vout);
+                            if outputs.is_empty() {
+                                self.utxos.remove(&input.txid);
+                            }
+                        }
+                    }
                 }
                 
-                // 添加新的UTXO
-                for (i, output) in tx.outputs.iter().enumerate() {
-                    let key = format!("{}:{}", tx.id, i);
-                    self.utxos.insert(key, output.clone());
+                // Add new unspent outputs
+                let mut outputs = Vec::new();
+                for (vout, output) in tx.outputs.iter().enumerate() {
+                    outputs.push((vout, output.clone()));
+                }
+                self.utxos.insert(tx.id.clone(), outputs);
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn get_balance(&self, address: &str) -> Result<i64, Box<dyn Error>> {
+        let mut balance = 0;
+        
+        for (_, outputs) in self.utxos.iter() {
+            for (_, output) in outputs {
+                if bs58::encode(&output.pub_key_hash).into_string() == address {
+                    balance += output.value;
                 }
             }
         }
         
-        // 保存更新后的UTXO集
-        self.save()?;
-        
-        println!("UTXO集合重建完成");
-        Ok(())
+        Ok(balance)
     }
 
-    // 检查UTXO是否存在
-    pub fn exists_utxo(&self, txid: &str, vout: i32) -> Result<bool, Box<dyn Error>> {
-        let utxo_key = format!("{}:{}", txid, vout);
-        Ok(self.utxos.contains_key(&utxo_key))
-    }
-
-    // 查找特定的UTXO
-    pub fn find_utxo(&self, txid: &str, vout: i32) -> Result<Option<&TxOutput>, Box<dyn Error>> {
-        let utxo_key = format!("{}:{}", txid, vout);
-        Ok(self.utxos.get(&utxo_key))
+    pub fn find_utxo(&self, txid: &str, vout: usize) -> Result<Option<TxOutput>, Box<dyn Error>> {
+        if let Some(outputs) = self.utxos.get(txid) {
+            for (idx, output) in outputs {
+                if *idx == vout {
+                    return Ok(Some(output.clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 }

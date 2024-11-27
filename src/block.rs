@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
+
+use ring::digest;
+use serde::{Deserialize, Serialize};
+
 use crate::transaction::Transaction;
 
-const MINING_DIFFICULTY: usize = 4;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Block {
     pub timestamp: u64,
     pub transactions: Vec<Transaction>,
@@ -17,17 +17,19 @@ pub struct Block {
 
 impl Block {
     pub fn new(transactions: Vec<Transaction>, prev_block_hash: String) -> Result<Block, Box<dyn Error>> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+
         let mut block = Block {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs(),
+            timestamp,
             transactions,
             prev_block_hash,
             hash: String::new(),
             nonce: 0,
         };
-        
-        block.mine_block(MINING_DIFFICULTY)?;
+
+        block.hash = block.calculate_hash()?;
         Ok(block)
     }
     
@@ -38,28 +40,35 @@ impl Block {
     
     pub fn mine_block(&mut self, difficulty: usize) -> Result<(), Box<dyn Error>> {
         let target = "0".repeat(difficulty);
-        
-        while {
-            self.hash = self.calculate_hash()?;
-            !self.hash.starts_with(&target)
-        } {
+        println!("Mining block...");
+        while !self.hash.starts_with(&target) {
             self.nonce += 1;
+            self.hash = self.calculate_hash()?;
         }
+        println!("Block mined! Nonce: {}, Hash: {}", self.nonce, self.hash);
         
         Ok(())
     }
     
     fn calculate_hash(&self) -> Result<String, Box<dyn Error>> {
-        let mut hasher = Sha256::new();
-        hasher.update(self.prev_block_hash.as_bytes());
-        hasher.update(&self.timestamp.to_be_bytes());
+        let mut hasher = digest::Context::new(&digest::SHA256);
         
-        // 序列化交易并更新哈希
         let tx_data = bincode::serialize(&self.transactions)?;
-        hasher.update(&tx_data);
+        let data = format!(
+            "{}{}",
+            self.prev_block_hash,
+            self.timestamp,
+        );
         
+        hasher.update(data.as_bytes());
+        hasher.update(&tx_data);
         hasher.update(&self.nonce.to_be_bytes());
         
-        Ok(format!("{:x}", hasher.finalize()))
+        let hash = hasher.finish();
+        Ok(hex::encode(hash.as_ref()))
+    }
+    
+    pub fn get_transactions(&self) -> &Vec<Transaction> {
+        &self.transactions
     }
 }

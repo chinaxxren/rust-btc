@@ -1,24 +1,25 @@
 use std::error::Error;
-use std::sync::Arc;
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
+
+use bs58;
+use ring::digest;
+use serde::{Deserialize, Serialize};
+
 use crate::utxo::UTXOSet;
 use crate::wallet::Wallet;
-use std::collections::HashMap;
-use bs58;
-use rayon::prelude::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const SUBSIDY: i64 = 50;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TxInput {
-    pub txid: String,     // 引用的交易ID
-    pub vout: i32,        // 引用的输出索引
-    pub signature: Vec<u8>, // 签名
-    pub pubkey: Vec<u8>,   // 公钥
-    pub value: i32,       // 输入金额
+    pub txid: String,
+    pub vout: usize,
+    pub signature: Vec<u8>,
+    pub pubkey: Vec<u8>,
+    pub value: i64,
 }
 
 impl TxInput {
-    pub fn new(txid: String, vout: i32, value: i32) -> Self {
+    pub fn new(txid: String, vout: usize, value: i64) -> Self {
         TxInput {
             txid,
             vout,
@@ -29,13 +30,13 @@ impl TxInput {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TxOutput {
-    pub value: i32,
-    pub pub_key_hash: String,
+    pub value: i64,
+    pub pub_key_hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
     pub id: String,
     pub inputs: Vec<TxInput>,
@@ -43,146 +44,32 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> Result<Transaction, Box<dyn Error>> {
-        let mut tx = Transaction {
-            id: String::new(),
-            inputs,
-            outputs,
-        };
-        
-        tx.id = tx.hash()?;
-        Ok(tx)
-    }
-    
-    pub fn hash(&self) -> Result<String, Box<dyn Error>> {
-        let mut tx_copy = self.clone();
-        for input in &mut tx_copy.inputs {
-            input.signature = Vec::new();
-            input.pubkey = Vec::new();
-        }
-        
-        let encoded: Vec<u8> = bincode::serialize(&tx_copy)?;
-        let hash = Sha256::digest(&encoded);
-        Ok(hex::encode(hash))
-    }
-    
-    pub fn sign(&mut self, wallet: &Wallet, prev_txs: &HashMap<String, Transaction>) -> Result<(), Box<dyn Error>> {
-        if self.is_coinbase() {
-            return Ok(());
-        }
-        
-        // 验证所有输入都有对应的前一笔交易
-        for input in &self.inputs {
-            if !prev_txs.contains_key(&input.txid) {
-                return Err("前一笔交易不存在".into());
-            }
-        }
-        
-        // 创建交易副本
-        let mut tx_copy = self.clone();
-        
-        // 清除所有输入的签名和公钥
-        for input in &mut tx_copy.inputs {
-            input.signature = Vec::new();
-            input.pubkey = Vec::new();
-        }
-        
-        // 使用迭代器对每个输入进行签名
-        for i in 0..self.inputs.len() {
-            // 设置当前输入的公钥
-            let pub_key = bs58::encode(wallet.get_public_key()).into_string();
-            let pub_key_bytes = bs58::decode(&pub_key).into_vec()?;
-            
-            // 设置交易副本的公钥
-            tx_copy.inputs[i].pubkey = pub_key_bytes.clone();
-            
-            // 计算交易哈希并签名
-            let tx_hash = tx_copy.hash()?;
-            let signature = wallet.sign(tx_hash.as_bytes())?;
-            
-            // 设置原始交易的签名和公钥
-            self.inputs[i].signature = signature;
-            self.inputs[i].pubkey = pub_key_bytes;
-            
-            // 清除当前输入的公钥，为下一个输入做准备
-            tx_copy.inputs[i].pubkey = Vec::new();
-        }
-        
-        Ok(())
-    }
-    
-    pub fn verify(&self, prev_txs: &HashMap<String, Transaction>) -> Result<bool, Box<dyn Error>> {
-        if self.is_coinbase() {
-            return Ok(true);
-        }
-        
-        let prev_txs = Arc::new(prev_txs.clone());
-        
-        // 验证所有输入
-        let results: Vec<bool> = self.inputs
-            .par_iter()
-            .map(|input| {
-                let prev_txs = Arc::clone(&prev_txs);
-                match verify_input(input, self, &prev_txs) {
-                    Ok(valid) => valid,
-                    Err(_) => false,
-                }
-            })
-            .collect();
-        
-        Ok(!results.contains(&false))
-    }
-    
-    pub fn new_coinbase(to: &str, _data: &str) -> Result<Transaction, Box<dyn Error>> {
-        println!("\n创建coinbase交易...");
-        println!("接收方: {}", to);
-        println!("奖励金额: 50代币");
-        
-        let input = TxInput {
-            txid: String::from("0"),
-            vout: -1,
-            signature: Vec::new(),
-            pubkey: Vec::new(),
-            value: 0,
-        };
-        
-        let output = TxOutput {
-            value: 50,
-            pub_key_hash: to.to_string(),
-        };
-        
-        let mut tx = Transaction {
-            id: String::new(),
-            inputs: vec![input],
-            outputs: vec![output],
-        };
-        
-        tx.id = tx.hash()?;
-        println!("交易ID: {}", tx.id);
-        
-        Ok(tx)
-    }
-    
-    pub fn new_transaction(
-        from: &str,
-        to: &str,
-        amount: i32,
+    pub fn new(
+        from_wallet: &Wallet,
+        to_address: &str,
+        amount: i64,
         utxo_set: &UTXOSet,
     ) -> Result<Transaction, Box<dyn Error>> {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
         // 找到足够的UTXO
-        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(from, amount)?;
+        let (accumulated, valid_outputs) = utxo_set.find_spendable_outputs(&from_wallet.get_address(), amount)?;
 
-        if acc < amount {
+        if accumulated < amount {
             return Err("余额不足".into());
         }
 
         // 构建输入
-        for (txid, vout) in valid_outputs {
-            if let Some(utxo) = utxo_set.find_utxo(&txid, vout)? {
-                let input = TxInput::new(txid, vout, utxo.value);
+        for (txid, outs) in valid_outputs {
+            for (vout, output) in outs {
+                let input = TxInput {
+                    txid: txid.clone(),
+                    vout,
+                    signature: Vec::new(),
+                    pubkey: from_wallet.get_public_key().to_vec(),
+                    value: output.value,
+                };
                 inputs.push(input);
             }
         }
@@ -190,14 +77,13 @@ impl Transaction {
         // 构建输出
         outputs.push(TxOutput {
             value: amount,
-            pub_key_hash: to.to_string(),
+            pub_key_hash: bs58::decode(to_address).into_vec()?,
         });
 
-        // 如果有找零，添加找零输出
-        if acc > amount {
+        if accumulated > amount {
             outputs.push(TxOutput {
-                value: acc - amount,
-                pub_key_hash: from.to_string(),
+                value: accumulated - amount,
+                pub_key_hash: bs58::decode(&from_wallet.get_address()).into_vec()?,
             });
         }
 
@@ -207,55 +93,85 @@ impl Transaction {
             outputs,
         };
 
-        // 设置交易ID
         tx.id = tx.hash()?;
+        tx.sign(from_wallet)?;
 
         Ok(tx)
     }
-    
-    pub fn is_coinbase(&self) -> bool {
-        self.inputs.len() == 1 && self.inputs[0].txid == "0" && self.inputs[0].vout == -1
-    }
-    
-    // 计算交易的每字节费用率
-    pub fn calculate_fee_rate(&self) -> f64 {
-        // 简单实现：假设每个交易的大小是固定的100字节
-        // 实际应用中应该计算真实的序列化大小
-        const ASSUMED_TX_SIZE: f64 = 100.0;
-        
-        // 计算输入总额
-        let input_sum: i32 = self.inputs.iter()
-            .map(|input| input.value)
-            .sum();
-        
-        // 计算输出总额
-        let output_sum: i32 = self.outputs.iter()
-            .map(|output| output.value)
-            .sum();
-        
-        // 计算费用
-        let fee = input_sum - output_sum;
-        
-        // 计算费率（每字节的费用）
-        fee as f64 / ASSUMED_TX_SIZE
-    }
-}
 
-// 辅助函数：验证单个输入
-fn verify_input(input: &TxInput, tx: &Transaction, prev_txs: &HashMap<String, Transaction>) -> Result<bool, Box<dyn Error>> {
-    let _prev_tx = prev_txs.get(&input.txid)
-        .ok_or_else(|| "前一笔交易不存在".to_string())?;
-    
-    let pub_key = input.pubkey.clone();
-    let wallet = Wallet::from_public_key(&pub_key)?;
-    
-    // 创建用于验证的交易副本
-    let mut tx_copy = tx.clone();
-    for input in &mut tx_copy.inputs {
-        input.signature = Vec::new();
-        input.pubkey = Vec::new();
+    pub fn new_coinbase(to: &str, data: &str) -> Result<Transaction, Box<dyn Error>> {
+        let mut tx = Transaction {
+            id: String::new(),
+            inputs: vec![TxInput {
+                txid: String::from("0"),
+                vout: 0,
+                signature: Vec::new(),
+                pubkey: data.as_bytes().to_vec(),
+                value: SUBSIDY,
+            }],
+            outputs: vec![TxOutput {
+                value: SUBSIDY,
+                pub_key_hash: bs58::decode(to).into_vec()?,
+            }],
+        };
+
+        tx.id = tx.hash()?;
+        Ok(tx)
     }
-    
-    let tx_hash = tx_copy.hash()?;
-    wallet.verify(tx_hash.as_bytes(), &input.signature)
+
+    pub fn hash(&self) -> Result<String, Box<dyn Error>> {
+        let data = bincode::serialize(self)?;
+        let mut hasher = digest::Context::new(&digest::SHA256);
+        hasher.update(&data);
+        let hash = hasher.finish();
+        Ok(hex::encode(hash.as_ref()))
+    }
+
+    pub fn sign(&mut self, wallet: &Wallet) -> Result<(), Box<dyn Error>> {
+        // 为每个输入签名
+        for input in &mut self.inputs {
+            // 设置公钥
+            input.pubkey = wallet.get_public_key().to_vec();
+            
+            // 创建签名
+            let signature = wallet.sign(&input.pubkey)?;
+            input.signature = signature;
+        }
+        Ok(())
+    }
+
+    pub fn verify(&self, utxo_set: &UTXOSet) -> Result<bool, Box<dyn Error>> {
+        // 验证输入
+        for input in &self.inputs {
+            // 检查UTXO是否存在
+            if !utxo_set.exists_utxo(&input.txid, input.vout)? {
+                return Ok(false);
+            }
+            
+            // 验证输入的有效性（包括签名验证）
+            if !utxo_set.verify_input(input)? {
+                return Ok(false);
+            }
+        }
+        
+        // 验证输入总额是否大于等于输出总额
+        let input_value: i64 = self.inputs.iter().map(|input| input.value).sum();
+        let output_value: i64 = self.outputs.iter().map(|output| output.value).sum();
+        if input_value < output_value {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
+
+    pub fn calculate_fee_rate(&self) -> f64 {
+        let input_value: i64 = self.inputs.iter().map(|input| input.value).sum();
+        let output_value: i64 = self.outputs.iter().map(|output| output.value).sum();
+        let fee = input_value - output_value;
+        fee as f64 / 1000.0 // 每KB的费用
+    }
+
+    pub fn is_coinbase(&self) -> bool {
+        self.inputs.len() == 1 && self.inputs[0].txid == "0" && self.inputs[0].vout == 0
+    }
 }
