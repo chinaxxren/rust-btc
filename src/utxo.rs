@@ -127,8 +127,8 @@ impl UTXOSet {
     pub fn reindex(&mut self, blockchain: &Blockchain) -> Result<(), Box<dyn Error>> {
         self.utxos.clear();
         
-        for block in blockchain.blocks()?.iter() {
-            for tx in block.transactions.iter() {
+        for block in blockchain.blocks().iter() {
+            for tx in &block.transactions {
                 // Remove spent outputs
                 if !tx.is_coinbase() {
                     for input in &tx.inputs {
