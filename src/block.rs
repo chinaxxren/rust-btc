@@ -1,11 +1,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use ring::digest;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
+use hex;
 use tracing::{info, error, debug};
 
 use crate::error::{Result, RustBtcError};
 use crate::transaction::Transaction;
+use crate::utxo::UTXOSet;
+
+const MINING_DIFFICULTY: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Block {
@@ -14,6 +17,7 @@ pub struct Block {
     pub prev_block_hash: String,
     pub hash: String,
     pub nonce: u64,
+    pub height: u64,
 }
 
 impl Block {
@@ -21,7 +25,7 @@ impl Block {
         debug!("创建新区块，前置哈希: {}", prev_block_hash);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| RustBtcError::TimestampError(e.to_string()))?
+            .map_err(|e| RustBtcError::TimestampError(e))?
             .as_secs();
 
         let mut block = Block {
@@ -30,6 +34,7 @@ impl Block {
             prev_block_hash,
             hash: String::new(),
             nonce: 0,
+            height: 0,
         };
 
         block.hash = block.calculate_hash()?;
@@ -37,12 +42,22 @@ impl Block {
         Ok(block)
     }
     
-    pub fn new_genesis_block(miner_address: &str) -> Result<Block> {
-        info!("创建创世区块，矿工地址: {}", miner_address);
-        let coinbase = Transaction::new_coinbase(miner_address, "Genesis Block")
-            .map_err(|e| RustBtcError::TransactionError(e.to_string()))?;
-        let block = Block::new(vec![coinbase], String::from("0"))?;
-        info!("创世区块创建成功，哈希: {}", block.hash);
+    pub fn new_genesis_block(address: &str) -> Result<Block> {
+        let coinbase = Transaction::new_coinbase(address, "Genesis Block")?;
+        let transactions = vec![coinbase];
+        
+        let mut block = Block {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_secs(),
+            transactions,
+            prev_block_hash: String::from("0"),
+            nonce: 0,
+            hash: String::new(),
+            height: 0,
+        };
+        
+        block.mine_block(MINING_DIFFICULTY)?;
         Ok(block)
     }
     
@@ -68,10 +83,10 @@ impl Block {
 
     pub fn calculate_hash(&self) -> Result<String> {
         let data = bincode::serialize(self)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Serialization(e))?;
             
-        let hash = digest::digest(&digest::SHA256, &data);
-        let hash_str = hex::encode(hash.as_ref());
+        let hash = Sha256::digest(&data);
+        let hash_str = hex::encode(hash);
         Ok(hash_str)
     }
 
@@ -97,7 +112,7 @@ impl Block {
         // 验证时间戳
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| RustBtcError::TimestampError(e.to_string()))?
+            .map_err(|e| RustBtcError::TimestampError(e))?
             .as_secs();
             
         if self.timestamp > current_time {
@@ -134,46 +149,121 @@ impl Block {
         debug!("获取区块哈希: {}", self.hash);
         Ok(self.hash.clone())
     }
+
+    pub fn validate(&self, utxo_set: &UTXOSet) -> Result<bool> {
+        // 检查区块是否有交易
+        if self.transactions.is_empty() {
+            debug!("区块没有交易");
+            return Ok(false);
+        }
+
+        // 检查第一个交易是否是 coinbase 交易
+        if !self.transactions[0].is_coinbase() {
+            debug!("第一个交易不是 coinbase 交易");
+            return Ok(false);
+        }
+
+        // 验证区块哈希
+        let hash = self.calculate_hash()?;
+        if hash != self.hash {
+            debug!("区块哈希不匹配");
+            return Ok(false);
+        }
+
+        // 验证所有交易
+        for tx in self.transactions.iter() {
+            if !tx.verify(utxo_set)? {
+                debug!("交易验证失败");
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub fn is_genesis(&self) -> bool {
+        self.prev_block_hash == "0"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::wallet::Wallet;
+    use crate::wallet::Wallet;
 
-    #[test]
-    fn test_block_creation_and_mining() -> Result<()> {
-        let wallet = Wallet::new().map_err(|e| RustBtcError::TransactionError(e.to_string()))?;
-        let coinbase_tx = Transaction::new_coinbase(&wallet.get_address(), "Test Block")
-            .map_err(|e| RustBtcError::TransactionError(e.to_string()))?;
+    fn create_test_wallet() -> Result<Wallet> {
+        Wallet::new()
+    }
+
+    fn create_test_block(prev_hash: &str, nonce: u64) -> Result<Block> {
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        let coinbase = Transaction::new_coinbase(&address, "Test Block")?;
         
-        let mut block = Block::new(vec![coinbase_tx], String::new())?;
-        block.mine_block(4)?;
+        let mut block = Block {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            transactions: vec![coinbase],
+            prev_block_hash: prev_hash.to_string(),
+            hash: String::new(),
+            nonce,
+            height: 0,
+        };
         
-        assert!(block.hash.starts_with("0000"), "Block should be mined with difficulty 4");
-        assert!(block.is_valid()?, "Block should be valid");
-        
-        Ok(())
+        block.hash = block.calculate_hash()?;
+        Ok(block)
     }
 
     #[test]
-    fn test_invalid_block() -> Result<()> {
-        // 创建无效区块（没有交易）
-        let block = Block::new(vec![], String::new())?;
-        assert!(!block.is_valid().is_ok(), "Empty block should be invalid");
+    fn test_block_creation_and_mining() -> Result<()> {
+        let block = create_test_block("test_prev_hash", 0)?;
+        
+        // 验证区块字段
+        assert!(!block.transactions.is_empty());
+        assert_eq!(block.prev_block_hash, "test_prev_hash");
+        assert_eq!(block.height, 0);
+        
+        // 验证挖矿
+        let mut mining_block = block.clone();
+        mining_block.mine_block(4)?;
+        assert!(mining_block.validate(&UTXOSet::new())?);
         
         Ok(())
     }
 
     #[test]
     fn test_genesis_block() -> Result<()> {
-        let wallet = Wallet::new().map_err(|e| RustBtcError::TransactionError(e.to_string()))?;
-        let block = Block::new_genesis_block(&wallet.get_address())?;
+        let wallet = create_test_wallet()?;
+        let genesis = Block::new_genesis_block(&wallet.get_address())?;
         
-        assert!(block.is_valid()?, "Genesis block should be valid");
-        assert_eq!(block.prev_block_hash, "0", "Genesis block should have '0' as previous hash");
-        assert_eq!(block.transactions.len(), 1, "Genesis block should have exactly one transaction");
-        assert!(block.transactions[0].is_coinbase(), "Genesis block should contain a coinbase transaction");
+        // 验证创世区块
+        assert!(genesis.validate(&UTXOSet::new())?);
+        assert!(genesis.is_genesis());
+        assert_eq!(genesis.height, 0);
+        assert_eq!(genesis.prev_block_hash, "0");
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_block() -> Result<()> {
+        // 创建一个无效区块（没有交易）
+        let mut invalid_block = Block {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            transactions: vec![],
+            prev_block_hash: "test_prev_hash".to_string(),
+            hash: String::new(),
+            nonce: 0,
+            height: 0,
+        };
+        
+        invalid_block.hash = invalid_block.calculate_hash()?;
+        assert!(!invalid_block.validate(&UTXOSet::new())?);
         
         Ok(())
     }

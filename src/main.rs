@@ -19,7 +19,7 @@ use rust_btc::{
 
 fn cleanup_data() -> Result<()> {
     let _ = fs::remove_dir_all("data");
-    fs::create_dir_all("data").map_err(|e| RustBtcError::IOError(e.to_string()))?;
+    fs::create_dir_all("data").map_err(|e| RustBtcError::Io(e))?;
     Ok(())
 }
 

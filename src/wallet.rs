@@ -128,10 +128,10 @@ impl Wallets {
     pub fn new() -> Result<Wallets> {
         if Path::new(WALLET_FILE).exists() {
             let data = fs::read(WALLET_FILE)
-                .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+                .map_err(|e| RustBtcError::Io(e))?;
                 
             let wallets: Wallets = bincode::deserialize(&data)
-                .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::SerializationError(e.to_string()))?;
+                .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::Serialization(e))?;
                 
             Ok(wallets)
         } else {
@@ -165,10 +165,10 @@ impl Wallets {
     // 保存钱包到文件
     pub fn save(&self) -> Result<()> {
         let data = bincode::serialize(&self)
-            .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::SerializationError(e.to_string()))?;
+            .map_err(|e: Box<bincode::ErrorKind>| RustBtcError::Serialization(e))?;
 
         fs::write(WALLET_FILE, data)
-            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Io(e))?;
             
         Ok(())
     }

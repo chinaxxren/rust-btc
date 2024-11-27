@@ -30,7 +30,7 @@ impl Blockchain {
         debug!("开始添加新区块, 前置哈希: {}", block.prev_block_hash);
         
         let block_size = bincode::serialize(&block)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?
+            .map_err(|e| RustBtcError::Serialization(e))?
             .len();
             
         if block_size > MAX_BLOCK_SIZE {
@@ -88,9 +88,9 @@ impl Blockchain {
     pub fn save_to_file(&self) -> Result<()> {
         info!("开始保存区块链到文件");
         let data = bincode::serialize(self)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Serialization(e))?;
         fs::write("blockchain.dat", data)
-            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Io(e))?;
         info!("区块链成功保存到文件");
         Ok(())
     }
@@ -103,7 +103,7 @@ impl Blockchain {
         }
 
         let data = fs::read("blockchain.dat")
-            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Io(e))?;
         let blockchain = bincode::deserialize(&data)
             .map_err(|e| RustBtcError::DeserializationError(e.to_string()))?;
         info!("成功从文件加载区块链");

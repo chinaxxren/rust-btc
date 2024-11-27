@@ -47,7 +47,7 @@ impl Mempool {
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<()> {
         let tx_size = bincode::serialize(&tx)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?
+            .map_err(|e| RustBtcError::Serialization(e))?
             .len();
 
         if tx_size > MAX_TRANSACTION_SIZE {
@@ -174,78 +174,92 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
-    use crate::Wallet;
-
     use super::*;
+    use crate::wallet::Wallet;
 
-    #[test]
-    fn test_mempool_basic_operations() -> Result<()> {
-        let utxo_set = Arc::new(UTXOSet::new());
-        let mut mempool = Mempool::new(utxo_set);
-        let wallet = Wallet::new().map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-
-        // Create test transaction
-        let tx = Transaction::new_coinbase(&wallet.get_address(), "test")
-            .map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-        
-        // Add transaction to mempool
-        mempool.add_transaction(tx.clone())?;
-
-        // Verify transaction exists
-        let tx_hash = tx.hash()?;
-        let retrieved_tx = mempool.get_transaction(&tx_hash)?;
-        assert_eq!(retrieved_tx.hash()?, tx_hash);
-
-        // Remove transaction
-        mempool.remove_transaction(&tx_hash)?;
-        assert!(mempool.get_transaction(&tx_hash).is_err());
-
-        Ok(())
+    fn create_test_wallet() -> Result<Wallet> {
+        Wallet::new()
     }
 
     #[test]
-    fn test_mempool_duplicate_transaction() -> Result<()> {
-        let utxo_set = Arc::new(UTXOSet::new());
-        let mut mempool = Mempool::new(utxo_set);
-        let wallet = Wallet::new().map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-
-        // Create test transaction
-        let tx = Transaction::new_coinbase(&wallet.get_address(), "test")
-            .map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-
-        // First addition should succeed
+    fn test_mempool_basic_operations() -> Result<()> {
+        let mut mempool = Mempool::new(Arc::new(UTXOSet::new()));
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        
+        // 创建测试交易
+        let tx = Transaction::new_coinbase(&address, "Test Mempool")?;
+        
+        // 添加交易到 mempool
         mempool.add_transaction(tx.clone())?;
-
-        // Second addition should fail
-        assert!(matches!(
-            mempool.add_transaction(tx.clone()),
-            Err(RustBtcError::DuplicateTransaction(_))
-        ));
-
+        
+        // 验证交易已添加
+        assert!(mempool.get_transaction(&tx.hash().unwrap()).is_ok());
+        assert_eq!(mempool.size(), 1);
+        
         Ok(())
     }
 
     #[test]
     fn test_mempool_capacity() -> Result<()> {
-        let utxo_set = Arc::new(UTXOSet::new());
-        let mut mempool = Mempool::new(utxo_set);
-        let wallet = Wallet::new().map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-
-        // Create test transaction
-        let tx = Transaction::new_coinbase(&wallet.get_address(), "test")
-            .map_err(|e| RustBtcError::ValidationError(e.to_string()))?;
-
-        // Add transactions until capacity limit
-        for _ in 0..MAX_MEMPOOL_SIZE {
-            let _ = mempool.add_transaction(tx.clone());
+        let mut mempool = Mempool::new(Arc::new(UTXOSet::new()));
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        
+        // 创建并添加多个交易
+        for i in 0..3 {
+            let tx = Transaction::new_coinbase(&address, &format!("Test {}", i))?;
+            let result = mempool.add_transaction(tx);
+            
+            if i < 2 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(RustBtcError::CapacityExceeded(_))));
+            }
         }
+        
+        assert_eq!(mempool.size(), 2);
+        Ok(())
+    }
 
-        // Adding one more transaction should fail
+    #[test]
+    fn test_mempool_duplicate_transaction() -> Result<()> {
+        let mut mempool = Mempool::new(Arc::new(UTXOSet::new()));
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        
+        // 创建测试交易
+        let tx = Transaction::new_coinbase(&address, "Test Duplicate")?;
+        
+        // 第一次添加应该成功
+        mempool.add_transaction(tx.clone())?;
+        
+        // 第二次添加应该失败
         assert!(matches!(
-            mempool.add_transaction(tx.clone()),
-            Err(RustBtcError::CapacityExceeded(_))
+            mempool.add_transaction(tx),
+            Err(RustBtcError::DuplicateTransaction(_))
         ));
+        
+        assert_eq!(mempool.size(), 1);
+        Ok(())
+    }
 
+    #[test]
+    fn test_mempool_coinbase_transaction() -> Result<()> {
+        let mut mempool = Mempool::new(Arc::new(UTXOSet::new()));
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        
+        // 创建 coinbase 交易
+        let tx = Transaction::new_coinbase(&address, "Test Coinbase")?;
+        
+        // 添加 coinbase 交易
+        mempool.add_transaction(tx.clone())?;
+        
+        // 验证交易已添加
+        assert!(mempool.get_transaction(&tx.hash().unwrap()).is_ok());
+        assert_eq!(mempool.size(), 1);
+        
         Ok(())
     }
 }

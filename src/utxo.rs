@@ -9,8 +9,10 @@ use tracing::{info, warn, error, debug};
 use crate::error::{Result, RustBtcError};
 use crate::blockchain::Blockchain;
 use crate::transaction::{Transaction, TxOutput, TxInput};
+use crate::wallet::Wallet;
 
 const UTXO_TREE_FILE: &str = "data/utxo.dat";
+const SUBSIDY: i64 = 50;  // 修改为 50
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UTXOSet {
@@ -98,14 +100,14 @@ impl UTXOSet {
         // 确保目录存在
         if let Some(parent) = Path::new(UTXO_TREE_FILE).parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+                .map_err(|e| RustBtcError::Io(e))?;
         }
         
         let data = bincode::serialize(self)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Serialization(e))?;
             
         fs::write(UTXO_TREE_FILE, data)
-            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Io(e))?;
             
         info!("UTXO集保存成功");
         Ok(())
@@ -120,7 +122,7 @@ impl UTXOSet {
         }
 
         let data = fs::read(UTXO_TREE_FILE)
-            .map_err(|e| RustBtcError::IOError(e.to_string()))?;
+            .map_err(|e| RustBtcError::Io(e))?;
             
         let utxo_set = bincode::deserialize(&data)
             .map_err(|e| RustBtcError::DeserializationError(e.to_string()))?;
@@ -252,6 +254,33 @@ impl UTXOSet {
         debug!("未找到指定的UTXO");
         Ok(None)
     }
+
+    pub fn find_transaction_output(&self, txid: &str, vout: usize) -> Result<TxOutput> {
+        debug!("查找交易输出: txid={}, vout={}", txid, vout);
+        
+        // 检查 UTXO 是否存在
+        if !self.exists_utxo(txid, vout)? {
+            return Err(RustBtcError::UTXONotFound(format!(
+                "UTXO不存在: txid={}, vout={}",
+                txid, vout
+            )));
+        }
+        
+        // 获取 UTXO
+        let utxos = self.utxos.get(txid).ok_or_else(|| {
+            RustBtcError::UTXONotFound(format!("UTXO不存在: txid={}", txid))
+        })?;
+        
+        // 获取指定的输出
+        let (_, output) = utxos.get(vout).ok_or_else(|| {
+            RustBtcError::UTXONotFound(format!(
+                "UTXO输出不存在: txid={}, vout={}",
+                txid, vout
+            ))
+        })?;
+        
+        Ok(output.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,106 +294,76 @@ pub struct UTXOInfo {
 mod tests {
     use super::*;
 
+    fn create_test_wallet() -> Result<Wallet> {
+        Wallet::new()
+    }
+
     #[test]
     fn test_utxo_basic_operations() -> Result<()> {
         let mut utxo_set = UTXOSet::new();
-        let test_address = "test_address";
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
         
-        // Create a test transaction
-        let mut tx = Transaction {
-            id: "test_tx".to_string(),
-            vin: vec![],
-            vout: vec![
-                TxOutput {
-                    value: 50,
-                    pubkey_hash: bs58::decode(test_address)
-                        .into_vec()
-                        .map_err(|e| RustBtcError::InvalidAddress(e.to_string()))?,
-                }
-            ],
-        };
-
-        // Update UTXO set with the transaction
+        // 创建测试交易
+        let tx = Transaction::new_coinbase(&address, "Test UTXO")?;
+        
+        // 添加 UTXO
         utxo_set.update(&[tx.clone()])?;
+        
+        // 验证 UTXO 已添加
+        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].value, SUBSIDY);
+        
+        Ok(())
+    }
 
-        // Verify UTXO exists
-        assert!(utxo_set.exists_utxo(&tx.id, 0)?);
-
-        // Check balance
-        assert_eq!(utxo_set.get_balance(test_address)?, 50);
-
+    #[test]
+    fn test_utxo_persistence() -> Result<()> {
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        
+        // 创建并保存 UTXO 集
+        {
+            let mut utxo_set = UTXOSet::new();
+            let tx = Transaction::new_coinbase(&address, "Test Persistence")?;
+            utxo_set.update(&[tx])?;
+            utxo_set.save()?;
+        }
+        
+        // 加载并验证 UTXO 集
+        {
+            let utxo_set = UTXOSet::load()?;
+            let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+            assert_eq!(utxos.len(), 1);
+            assert_eq!(utxos[0].value, SUBSIDY);
+        }
+        
         Ok(())
     }
 
     #[test]
     fn test_find_spendable_outputs() -> Result<()> {
         let mut utxo_set = UTXOSet::new();
-        let test_address = "test_address";
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
         
-        // Create test transactions
-        let tx1 = Transaction {
-            id: "tx1".to_string(),
-            vin: vec![],
-            vout: vec![
-                TxOutput {
-                    value: 30,
-                    pubkey_hash: bs58::decode(test_address)
-                        .into_vec()
-                        .map_err(|e| RustBtcError::InvalidAddress(e.to_string()))?,
-                }
-            ],
-        };
-
-        let tx2 = Transaction {
-            id: "tx2".to_string(),
-            vin: vec![],
-            vout: vec![
-                TxOutput {
-                    value: 20,
-                    pubkey_hash: bs58::decode(test_address)
-                        .into_vec()
-                        .map_err(|e| RustBtcError::InvalidAddress(e.to_string()))?,
-                }
-            ],
-        };
-
-        // Update UTXO set
-        utxo_set.update(&[tx1, tx2])?;
-
-        // Find spendable outputs for 40 coins
-        let outputs = utxo_set.find_spendable_outputs(test_address, 40)?;
-        assert_eq!(outputs.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_utxo_persistence() -> Result<()> {
-        let mut utxo_set = UTXOSet::new();
-        let test_address = "test_address";
+        // 创建多个测试交易
+        for i in 0..3 {
+            let tx = Transaction::new_coinbase(&address, &format!("Test {}", i))?;
+            utxo_set.update(&[tx])?;
+        }
         
-        // Create a test transaction
-        let tx = Transaction {
-            id: "test_tx".to_string(),
-            vin: vec![],
-            vout: vec![
-                TxOutput {
-                    value: 50,
-                    pubkey_hash: bs58::decode(test_address)
-                        .into_vec()
-                        .map_err(|e| RustBtcError::InvalidAddress(e.to_string()))?,
-                }
-            ],
-        };
-
-        // Update and save UTXO set
-        utxo_set.update(&[tx])?;
-        utxo_set.save()?;
-
-        // Load UTXO set and verify data
-        let loaded_utxo = UTXOSet::load()?;
-        assert_eq!(loaded_utxo.get_balance(test_address)?, 50);
-
+        // 测试不同金额的查找
+        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+        assert_eq!(utxos.len(), 1);  // 需要一个 UTXO 来满足 50 的金额
+        
+        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY * 2)?;
+        assert_eq!(utxos.len(), 2);  // 需要两个 UTXO 来满足 100 的金额
+        
+        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY * 3)?;
+        assert_eq!(utxos.len(), 3);  // 需要三个 UTXO 来满足 150 的金额
+        
         Ok(())
     }
 }

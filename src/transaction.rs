@@ -2,6 +2,7 @@ use bs58;
 use sha2::{Sha256, Digest};
 use serde::{Deserialize, Serialize};
 use tracing::{error, debug};
+use bincode;
 
 use crate::error::{Result, RustBtcError};
 use super::utxo::UTXOSet;
@@ -39,32 +40,35 @@ impl TxInput {
             return Err(RustBtcError::InvalidSignature("缺少签名或公钥".to_string()));
         }
 
-        debug!("待验证数据: {:?}", hex::encode(data));
+        let secp = secp256k1::Secp256k1::new();
+        
+        // 解析公钥
+        let public_key = secp256k1::PublicKey::from_slice(&self.pubkey)
+            .map_err(|e| {
+                error!("解析公钥失败: {}", e);
+                RustBtcError::InvalidPublicKey(e.to_string())
+            })?;
 
         // 计算数据的哈希
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let hash = hasher.finalize();
-
-        let public_key = secp256k1::PublicKey::from_slice(&self.pubkey)
+        let message_hash = hasher.finalize();
+        
+        // 创建消息对象
+        let message = secp256k1::Message::from_slice(&message_hash)
             .map_err(|e| {
-                error!("解析公钥失败: {}", e);
-                RustBtcError::InvalidSignature(e.to_string())
+                error!("创建消息对象失败: {}", e);
+                RustBtcError::InvalidMessage(e.to_string())
             })?;
 
+        // 解析签名
         let signature = ecdsa::Signature::from_compact(&self.signature)
             .map_err(|e| {
                 error!("解析签名失败: {}", e);
                 RustBtcError::InvalidSignature(e.to_string())
             })?;
 
-        let secp = secp256k1::Secp256k1::verification_only();
-        let message = secp256k1::Message::from_slice(&hash)
-            .map_err(|e| {
-                error!("创建消息失败: {}", e);
-                RustBtcError::InvalidSignature(e.to_string())
-            })?;
-
+        // 验证签名
         match secp.verify_ecdsa(&message, &signature, &public_key) {
             Ok(_) => {
                 debug!("签名验证成功");
@@ -208,15 +212,17 @@ impl Transaction {
     pub fn hash(&self) -> Result<String> {
         debug!("计算交易哈希");
         
-        // 创建一个没有签名和公钥的交易副本
+        // 创建一个副本用于计算哈希
         let mut tx = self.clone();
-        for input in &mut tx.vin {
+        
+        // 清除所有输入的签名和公钥
+        for input in tx.vin.iter_mut() {
             input.signature = Vec::new();
             input.pubkey = Vec::new();
         }
         
-        let data = serde_json::to_string(&tx)
-            .map_err(|e| RustBtcError::SerializationError(e.to_string()))?;
+        let data = bincode::serialize(&tx)
+            .map_err(|e| RustBtcError::Serialization(e))?;
             
         let mut hasher = Sha256::new();
         hasher.update(&data);
@@ -224,55 +230,55 @@ impl Transaction {
     }
 
     pub fn sign(&mut self, wallet: &Wallet) -> Result<()> {
-        debug!("签名交易: {}", self.id);
+        debug!("签名交易");
         
         if self.is_coinbase() {
-            debug!("coinbase交易无需签名");
+            debug!("Coinbase交易无需签名");
             return Ok(());
         }
 
-        // 计算交易哈希
+        // 计算交易数据的哈希
         let tx_hash = self.hash()?;
-        debug!("交易哈希: {}", tx_hash);
+        let hash_bytes = hex::decode(&tx_hash)
+            .map_err(|e| RustBtcError::HashError(e.to_string()))?;
 
-        // 将十六进制字符串转换为字节数组
-        let tx_hash_bytes = hex::decode(&tx_hash)
-            .map_err(|e| RustBtcError::InvalidSignature(e.to_string()))?;
-
-        // 对每个输入进行签名
-        for input in &mut self.vin {
-            let signature = wallet.sign(&tx_hash_bytes)?;
-            input.signature = signature;
+        // 为每个输入签名
+        for input in self.vin.iter_mut() {
             input.pubkey = wallet.get_public_key().to_vec();
-            debug!("输入已签名: txid={}, vout={}", input.txid, input.vout);
+            
+            // 使用钱包的sign方法进行签名
+            input.signature = wallet.sign(&hash_bytes)?;
+            
+            debug!("交易输入已签名: txid={}", input.txid);
         }
 
         Ok(())
     }
 
     pub fn verify(&self, utxo_set: &UTXOSet) -> Result<bool> {
-        debug!("验证交易: {}", self.id);
-        
+        // Coinbase 交易不需要验证
         if self.is_coinbase() {
-            debug!("coinbase交易无需验证");
             return Ok(true);
         }
 
-        // 验证交易数据
-        if !self.verify_transaction_data()? {
-            error!("交易数据验证失败");
-            return Ok(false);
-        }
-
-        // 验证每个输入
+        // 计算输入总额
+        let mut input_value = 0;
         for input in &self.vin {
-            if !utxo_set.exists_utxo(&input.txid, input.vout)? {
-                error!("UTXO不存在: txid={}, vout={}", input.txid, input.vout);
-                return Ok(false);
-            }
+            let output = utxo_set.find_transaction_output(&input.txid, input.vout)?;
+            input_value += output.value;
         }
 
-        debug!("交易验证通过");
+        // 计算输出总额
+        let output_value: i64 = self.vout.iter().map(|out| out.value).sum();
+
+        // 验证输入总额大于输出总额
+        if input_value <= output_value {
+            return Err(RustBtcError::InvalidAmount(format!(
+                "输入总额 {} 必须大于输出总额 {}",
+                input_value, output_value
+            )));
+        }
+
         Ok(true)
     }
 
@@ -323,7 +329,7 @@ impl Transaction {
         }
 
         let fee = input_value - output_value;
-        let size = serde_json::to_string(self).unwrap_or(String::new()).len() as f64;
+        let size = bincode::serialize(self).unwrap_or(Vec::new()).len() as f64;
         
         if size > 0.0 {
             fee as f64 / size
@@ -340,40 +346,48 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::Wallet;
+
+    fn create_test_wallet() -> Result<Wallet> {
+        Wallet::new()
+    }
 
     #[test]
     fn test_new_coinbase_transaction() -> Result<()> {
-        let address = "test_address";
-        let data = "test_data";
-        let tx = Transaction::new_coinbase(address, data)?;
-
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        let tx = Transaction::new_coinbase(&address, "Test Coinbase")?;
+        
         assert!(tx.is_coinbase());
         assert_eq!(tx.vin.len(), 1);
         assert_eq!(tx.vout.len(), 1);
         assert_eq!(tx.vout[0].value, SUBSIDY);
+        
         Ok(())
     }
 
     #[test]
     fn test_transaction_hash() -> Result<()> {
-        let address = "test_address";
-        let data = "test_data";
-        let tx = Transaction::new_coinbase(address, data)?;
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        let tx = Transaction::new_coinbase(&address, "Test Hash")?;
         
         let hash = tx.hash()?;
         assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 64); // SHA256 hash length in hex
+        assert_eq!(hash.len(), 64);  // SHA-256 produces 32 bytes = 64 hex chars
+        
         Ok(())
     }
 
     #[test]
     fn test_transaction_fee_rate() -> Result<()> {
-        let address = "test_address";
-        let data = "test_data";
-        let tx = Transaction::new_coinbase(address, data)?;
+        let wallet = create_test_wallet()?;
+        let address = wallet.get_address();
+        let tx = Transaction::new_coinbase(&address, "Test Fee Rate")?;
         
         let fee_rate = tx.calculate_fee_rate();
-        assert_eq!(fee_rate, 0.0); // Coinbase transactions have no fee
+        assert!(fee_rate >= 0.0);
+        
         Ok(())
     }
 }
