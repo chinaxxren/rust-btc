@@ -121,34 +121,49 @@ impl UTXOSet {
         Ok((accumulated, unspent_outputs))
     }
 
-    pub fn reindex(&mut self, blocks: &Vec<Block>) -> Result<(), Box<dyn Error>> {
-        println!("重建UTXO集合...");
+    // 重建UTXO集合
+    pub fn reindex(&mut self, blockchain: &Blockchain) -> Result<(), Box<dyn Error>> {
+        println!("\n重建UTXO集合...");
+        
+        // 清空当前UTXO
         self.utxos.clear();
         
         // 遍历所有区块
-        for block in blocks.iter() {
+        for block in blockchain.blocks()? {
             // 遍历区块中的所有交易
             for tx in &block.transactions {
-                // 标记已使用的UTXO
-                if !tx.is_coinbase() {
-                    for input in &tx.inputs {
-                        let key = format!("{}:{}", input.txid, input.vout);
-                        self.utxos.remove(&key);
-                    }
+                println!("处理交易: {}", tx.id);
+                
+                // 移除已使用的UTXO
+                for input in &tx.inputs {
+                    let key = format!("{}:{}", input.txid, input.vout);
+                    self.utxos.remove(&key);
                 }
                 
                 // 添加新的UTXO
-                for (idx, output) in tx.outputs.iter().enumerate() {
-                    let key = format!("{}:{}", tx.id, idx);
+                for (i, output) in tx.outputs.iter().enumerate() {
+                    let key = format!("{}:{}", tx.id, i);
                     self.utxos.insert(key, output.clone());
                 }
             }
         }
         
-        // 保存UTXO集合
+        // 保存更新后的UTXO集
         self.save()?;
         
         println!("UTXO集合重建完成");
         Ok(())
+    }
+
+    // 检查UTXO是否存在
+    pub fn exists_utxo(&self, txid: &str, vout: i32) -> Result<bool, Box<dyn Error>> {
+        let utxo_key = format!("{}:{}", txid, vout);
+        Ok(self.utxos.contains_key(&utxo_key))
+    }
+
+    // 查找特定的UTXO
+    pub fn find_utxo(&self, txid: &str, vout: i32) -> Result<Option<&TxOutput>, Box<dyn Error>> {
+        let utxo_key = format!("{}:{}", txid, vout);
+        Ok(self.utxos.get(&utxo_key))
     }
 }

@@ -7,10 +7,13 @@ use bs58;
 use std::collections::HashMap;
 use std::fs;
 use serde::{Serialize, Deserialize};
+use once_cell::sync::Lazy;
 
 const VERSION: u8 = 0x00;
 const CHECKSUM_LENGTH: usize = 4;
 const WALLET_FILE: &str = "wallet.dat";
+
+static SECP: Lazy<Secp256k1<secp256k1::All>> = Lazy::new(Secp256k1::new);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wallet {
@@ -20,11 +23,10 @@ pub struct Wallet {
 
 impl Wallet {
     pub fn new() -> Result<Wallet, Box<dyn Error>> {
-        let secp = Secp256k1::new();
         let mut rng = OsRng::default();
         
         // 生成密钥对
-        let (secret_key, public_key) = secp.generate_keypair(&mut rng);
+        let (secret_key, public_key) = SECP.generate_keypair(&mut rng);
         
         Ok(Wallet {
             secret_key: secret_key.secret_bytes().to_vec(),
@@ -70,12 +72,8 @@ impl Wallet {
     }
     
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-        let secp = Secp256k1::new();
-        
         // 创建消息哈希
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash = hasher.finalize();
+        let hash = Sha256::digest(data);
         
         // 创建消息
         let message = Message::from_slice(&hash)?;
@@ -84,30 +82,24 @@ impl Wallet {
         let secret_key = SecretKey::from_slice(&self.secret_key)?;
         
         // 签名消息
-        let signature = secp.sign_ecdsa(&message, &secret_key);
+        let signature = SECP.sign_ecdsa(&message, &secret_key);
         
         Ok(signature.serialize_compact().to_vec())
     }
     
     pub fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool, Box<dyn Error>> {
-        let secp = Secp256k1::new();
-        
         // 创建消息哈希
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash = hasher.finalize();
+        let hash = Sha256::digest(data);
         
         // 创建消息
         let message = Message::from_slice(&hash)?;
         
-        // 从字节创建公钥
+        // 从字节创建公钥和签名
         let public_key = PublicKey::from_slice(&self.public_key)?;
-        
-        // 从字节创建签名
         let signature = secp256k1::ecdsa::Signature::from_compact(signature)?;
         
         // 验证签名
-        Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
+        Ok(SECP.verify_ecdsa(&message, &signature, &public_key).is_ok())
     }
 }
 
