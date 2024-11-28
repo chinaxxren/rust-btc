@@ -92,6 +92,9 @@ pub enum RustBtcError {
 
     #[error("其他错误: {0}")]
     Other(String),
+
+    #[error("数据库错误: {0}")]
+    Database(String),
 }
 
 pub type Result<T> = std::result::Result<T, RustBtcError>;

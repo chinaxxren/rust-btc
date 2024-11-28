@@ -2,17 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use bs58;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{Result, RustBtcError};
-use crate::blockchain::Blockchain;
-use crate::transaction::{Transaction, TxOutput, TxInput};
-use crate::wallet::Wallet;
+use crate::transaction::{Transaction, TxInput, TxOutput};
 
 const UTXO_TREE_FILE: &str = "data/utxo.dat";
-const SUBSIDY: i64 = 50;  // 修改为 50
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UTXOSet {
@@ -131,7 +127,7 @@ impl UTXOSet {
         Ok(utxo_set)
     }
 
-    pub fn reindex(&mut self, blockchain: &Blockchain) -> Result<()> {
+    pub fn reindex(&mut self, blockchain: &crate::blockchain::Blockchain) -> Result<()> {
         info!("重建UTXO集索引");
         self.utxos.clear();
         
@@ -311,9 +307,9 @@ mod tests {
         utxo_set.update(&[tx.clone()])?;
         
         // 验证 UTXO 已添加
-        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+        let utxos = utxo_set.find_spendable_outputs(&address, 50)?;
         assert_eq!(utxos.len(), 1);
-        assert_eq!(utxos[0].value, SUBSIDY);
+        assert_eq!(utxos[0].value, 50);
         
         Ok(())
     }
@@ -334,9 +330,9 @@ mod tests {
         // 加载并验证 UTXO 集
         {
             let utxo_set = UTXOSet::load()?;
-            let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+            let utxos = utxo_set.find_spendable_outputs(&address, 50)?;
             assert_eq!(utxos.len(), 1);
-            assert_eq!(utxos[0].value, SUBSIDY);
+            assert_eq!(utxos[0].value, 50);
         }
         
         Ok(())
@@ -355,13 +351,13 @@ mod tests {
         }
         
         // 测试不同金额的查找
-        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY)?;
+        let utxos = utxo_set.find_spendable_outputs(&address, 50)?;
         assert_eq!(utxos.len(), 1);  // 需要一个 UTXO 来满足 50 的金额
         
-        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY * 2)?;
+        let utxos = utxo_set.find_spendable_outputs(&address, 100)?;
         assert_eq!(utxos.len(), 2);  // 需要两个 UTXO 来满足 100 的金额
         
-        let utxos = utxo_set.find_spendable_outputs(&address, SUBSIDY * 3)?;
+        let utxos = utxo_set.find_spendable_outputs(&address, 150)?;
         assert_eq!(utxos.len(), 3);  // 需要三个 UTXO 来满足 150 的金额
         
         Ok(())

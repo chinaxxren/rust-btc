@@ -1,6 +1,7 @@
 use crate::db::{Database, DbTable};
 use crate::error::Result;
-use crate::models::{Block, WalletData, UTXOEntry};
+use crate::models::{WalletData, UTXOEntry};
+use crate::block::Block;
 
 pub struct Storage {
     db: Database,

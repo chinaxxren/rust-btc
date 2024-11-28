@@ -12,12 +12,15 @@ const MINING_DIFFICULTY: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Block {
+    pub version: i32,
     pub timestamp: u64,
     pub transactions: Vec<Transaction>,
     pub prev_block_hash: String,
+    pub merkle_root: String,
     pub hash: String,
     pub nonce: u64,
     pub height: u64,
+    pub bits: u32,
 }
 
 impl Block {
@@ -28,33 +31,71 @@ impl Block {
             .map_err(|e| RustBtcError::TimestampError(e))?
             .as_secs();
 
+        let merkle_root = Self::calculate_merkle_root(&transactions)?;
+        
         let mut block = Block {
+            version: 1,
             timestamp,
             transactions,
             prev_block_hash,
+            merkle_root,
             hash: String::new(),
             nonce: 0,
             height: 0,
+            bits: 0x1d00ffff, // Default difficulty bits
         };
 
         block.hash = block.calculate_hash()?;
         info!("新区块创建成功，哈希: {}", block.hash);
         Ok(block)
     }
-    
+
+    fn calculate_merkle_root(transactions: &[Transaction]) -> Result<String> {
+        if transactions.is_empty() {
+            return Ok(String::from("0000000000000000000000000000000000000000000000000000000000000000"));
+        }
+
+        let mut hashes: Vec<String> = transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Result<_>>()?;
+
+        while hashes.len() > 1 {
+            let mut new_hashes = Vec::new();
+            for chunk in hashes.chunks(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(chunk[0].as_bytes());
+                if chunk.len() > 1 {
+                    hasher.update(chunk[1].as_bytes());
+                } else {
+                    hasher.update(chunk[0].as_bytes()); // If odd number, duplicate the last hash
+                }
+                let result = hex::encode(hasher.finalize());
+                new_hashes.push(result);
+            }
+            hashes = new_hashes;
+        }
+
+        Ok(hashes[0].clone())
+    }
+
     pub fn new_genesis_block(address: &str) -> Result<Block> {
         let coinbase = Transaction::new_coinbase(address, "Genesis Block")?;
         let transactions = vec![coinbase];
+        let merkle_root = Self::calculate_merkle_root(&transactions)?;
         
         let mut block = Block {
+            version: 1,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
                 .as_secs(),
-            transactions,
+            transactions: transactions.clone(),
             prev_block_hash: String::from("0"),
+            merkle_root,
             nonce: 0,
             hash: String::new(),
             height: 0,
+            bits: 0x1d00ffff, // Default difficulty bits
         };
         
         block.mine_block(MINING_DIFFICULTY)?;
@@ -186,6 +227,18 @@ impl Block {
     }
 }
 
+impl Block {
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self)
+            .map_err(|e| e.into())
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        bincode::deserialize(data)
+            .map_err(|e| e.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,15 +254,18 @@ mod tests {
         let coinbase = Transaction::new_coinbase(&address, "Test Block")?;
         
         let mut block = Block {
+            version: 1,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
             transactions: vec![coinbase],
             prev_block_hash: prev_hash.to_string(),
+            merkle_root: Block::calculate_merkle_root(&vec![coinbase])?,
             hash: String::new(),
             nonce,
             height: 0,
+            bits: 0x1d00ffff, // Default difficulty bits
         };
         
         block.hash = block.calculate_hash()?;
@@ -251,15 +307,18 @@ mod tests {
     fn test_invalid_block() -> Result<()> {
         // 创建一个无效区块（没有交易）
         let mut invalid_block = Block {
+            version: 1,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
             transactions: vec![],
             prev_block_hash: "test_prev_hash".to_string(),
+            merkle_root: Block::calculate_merkle_root(&vec![])?,
             hash: String::new(),
             nonce: 0,
             height: 0,
+            bits: 0x1d00ffff, // Default difficulty bits
         };
         
         invalid_block.hash = invalid_block.calculate_hash()?;

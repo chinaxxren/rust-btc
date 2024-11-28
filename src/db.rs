@@ -77,7 +77,10 @@ impl Database {
 
     pub fn iterate(&self, table: DbTable) -> Result<impl Iterator<Item = (IVec, IVec)>> {
         let tree = self.get_table(table)?;
-        Ok(tree.iter().filter_map(Result::ok))
+        Ok(tree.iter().filter_map(|r| match r {
+            Ok(item) => Some(item),
+            Err(_) => None
+        }))
     }
 }
 
